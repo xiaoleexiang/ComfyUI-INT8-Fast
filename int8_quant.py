@@ -319,9 +319,12 @@ if _COMFY_OPS_AVAILABLE:
                             # Excluded layers stay in original dtype, but convert bf16 to fp16 if hardware doesn't support it
                             self._is_quantized = False
                             if weight_tensor.dtype == torch.bfloat16 and not _SUPPORTS_BF16:
-                                self.weight = nn.Parameter(weight_tensor.to(_DEFAULT_NON_FP32_DTYPE), requires_grad=False)
+                                # Convert bf16 to fp16 in-place to avoid doubling memory
+                                weight_tensor = weight_tensor.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                                 if self.bias is not None and self.bias.dtype == torch.bfloat16:
-                                    self.bias = nn.Parameter(self.bias.to(_DEFAULT_NON_FP32_DTYPE), requires_grad=False)
+                                    bias_tensor = self.bias.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                             else:
                                 self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         elif Int8TensorwiseOps.dynamic_quantize:
@@ -359,10 +362,12 @@ if _COMFY_OPS_AVAILABLE:
                             # Not quantizing, not excluded, not force_fp32: convert to fp16 if bf16 and hardware doesn't support it
                             self._is_quantized = False
                             if weight_tensor.dtype == torch.bfloat16 and not _SUPPORTS_BF16:
-                                # Convert bf16 to fp16 for hardware without bf16 support
-                                self.weight = nn.Parameter(weight_tensor.to(_DEFAULT_NON_FP32_DTYPE), requires_grad=False)
+                                # Convert bf16 to fp16 in-place to avoid doubling memory
+                                weight_tensor = weight_tensor.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                                 if self.bias is not None and self.bias.dtype == torch.bfloat16:
-                                    self.bias = nn.Parameter(self.bias.to(_DEFAULT_NON_FP32_DTYPE), requires_grad=False)
+                                    bias_tensor = self.bias.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                             else:
                                 self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                 else:
