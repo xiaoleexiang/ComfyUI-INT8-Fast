@@ -5,6 +5,21 @@ import comfy.model_patcher
 import comfy.lora
 import comfy.utils
 
+# --- BF16 Support Check ---
+def _supports_bfloat16() -> bool:
+    """Check if the current CUDA device supports bfloat16."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        return major >= 8  # Ampere (SM80) and newer support bf16
+    except Exception:
+        return False
+
+_SUPPORTS_BF16 = _supports_bfloat16()
+_DEFAULT_COMPUTE_DTYPE = torch.bfloat16 if _SUPPORTS_BF16 else torch.float32
+_DEFAULT_NON_FP32_DTYPE = torch.float16 if not _SUPPORTS_BF16 else torch.bfloat16
+
 # Add this at the top of your file
 try:
     from .int8_fused_kernel import triton_int8_linear
@@ -141,7 +156,8 @@ if _COMFY_OPS_AVAILABLE:
         """
         Custom ComfyUI operations for INT8 tensorwise quantization.
         """
-        excluded_names = []
+        excluded_names = []  # Layers to skip quantization (stay in original dtype)
+        force_fp32_layers = []  # Layers to force fp32 computation (even if loaded as bf16/fp16)
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
         enable_convrot = False # Toggle for ConvRot Hadamard rotation
         use_triton = True  # Toggle for Triton fused kernel (mirrors _use_triton)
@@ -158,7 +174,8 @@ if _COMFY_OPS_AVAILABLE:
                 self._is_per_row = False  # Track quantization granularity
                 self._use_convrot = False  # Track if ConvRot was applied
                 self._weight_scale_scalar = None  # For scalar (non-tensor) scales
-                self.compute_dtype = torch.bfloat16
+                self.compute_dtype = _DEFAULT_COMPUTE_DTYPE
+                self._force_fp32 = False  # Track if this layer should compute in fp32
                 self.lora_patches = []  # List of (down_scaled, up, start, size) set by INT8ModelPatcher
             
             def reset_parameters(self):
@@ -287,12 +304,30 @@ if _COMFY_OPS_AVAILABLE:
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn):
                         # Load High-Precision
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
+                        is_force_fp32 = any(ex in prefix for ex in Int8TensorwiseOps.force_fp32_layers)
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                         
-                        if is_excluded or is_dim1 or not Int8TensorwiseOps.dynamic_quantize:
+                        if is_force_fp32:
+                            # Force fp32 computation for sensitive layers (works with or without quantization)
+                            self._force_fp32 = True
+                            self.compute_dtype = torch.float32
                             self._is_quantized = False
-                            self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-                        else:
+                            self.weight = nn.Parameter(weight_tensor.float(), requires_grad=False)
+                            if self.bias is not None:
+                                self.bias = nn.Parameter(self.bias.float(), requires_grad=False)
+                        elif is_excluded or is_dim1:
+                            # Excluded layers stay in original dtype, but convert bf16 to fp16 if hardware doesn't support it
+                            self._is_quantized = False
+                            if weight_tensor.dtype == torch.bfloat16 and not _SUPPORTS_BF16:
+                                # Convert bf16 to fp16 in-place to avoid doubling memory
+                                weight_tensor = weight_tensor.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                                if self.bias is not None and self.bias.dtype == torch.bfloat16:
+                                    bias_tensor = self.bias.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
+                            else:
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        elif Int8TensorwiseOps.dynamic_quantize:
                             # Quantize on the fly
                             device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
                             
@@ -323,9 +358,18 @@ if _COMFY_OPS_AVAILABLE:
                             self._weight_scale_scalar = None
                             self._is_quantized = True
                             self._is_per_row = True
-                    else:
-                        self._is_quantized = False
-                        self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        else:
+                            # Not quantizing, not excluded, not force_fp32: convert to fp16 if bf16 and hardware doesn't support it
+                            self._is_quantized = False
+                            if weight_tensor.dtype == torch.bfloat16 and not _SUPPORTS_BF16:
+                                # Convert bf16 to fp16 in-place to avoid doubling memory
+                                weight_tensor = weight_tensor.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                                if self.bias is not None and self.bias.dtype == torch.bfloat16:
+                                    bias_tensor = self.bias.to(_DEFAULT_NON_FP32_DTYPE, copy=False)
+                                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
+                            else:
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                 else:
                     missing_keys.append(weight_key)
                 
@@ -412,13 +456,24 @@ if _COMFY_OPS_AVAILABLE:
                 need_cast = self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0
                 
                 if not self._is_quantized:
+                    # Non-quantized path: still respect force_fp32 for sensitive layers
                     if need_cast:
                         weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
-                        out = F.linear(x, weight, bias)
-                        uncast_bias_weight(self, weight, bias, offload_stream)
+                    else:
+                        weight = self.weight
+                        bias = self.bias
+                    
+                    # Force fp32 compute for sensitive layers even when not quantized
+                    if getattr(self, '_force_fp32', False):
+                        out = F.linear(x, weight.to(torch.float32), bias.to(torch.float32) if bias is not None else None)
+                        if need_cast:
+                            uncast_bias_weight(self, weight, bias, offload_stream)
                         return out
                     else:
-                        return F.linear(x, self.weight, self.bias)
+                        out = F.linear(x, weight, bias)
+                        if need_cast:
+                            uncast_bias_weight(self, weight, bias, offload_stream)
+                        return out
                 
                 # INT8 quantized path
                 if need_cast:
@@ -437,7 +492,17 @@ if _COMFY_OPS_AVAILABLE:
                 if isinstance(w_scale, torch.Tensor) and w_scale.device != x.device:
                     w_scale = w_scale.to(x.device, non_blocking=True)
                 
-                compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+                # Determine compute dtype: force fp32 for sensitive layers, otherwise use input dtype or default
+                if getattr(self, '_force_fp32', False):
+                    compute_dtype = torch.float32
+                else:
+                    # Use input dtype, but convert bf16 to fp16 if hardware doesn't support bf16
+                    if x.dtype == torch.bfloat16 and not _SUPPORTS_BF16:
+                        compute_dtype = _DEFAULT_NON_FP32_DTYPE
+                    elif x.dtype in (torch.float16, torch.bfloat16):
+                        compute_dtype = x.dtype
+                    else:
+                        compute_dtype = _DEFAULT_COMPUTE_DTYPE
                 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
