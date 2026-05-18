@@ -28,6 +28,7 @@ class UNetLoaderINTW8A8:
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "dynamic_lora": ("BOOLEAN", {"default": False, "tooltip": "Apply LoRA dynamically at inference time. Slow. Only works with LoRA. Keep disabled unless you really need this."}),
+                "force_fp32_sensitive_layers": ("BOOLEAN", {"default": False, "tooltip": "Force sensitive layers to compute in FP32 instead of BF16/FP16. Works with or without quantization. Useful for GPUs without BF16 support or for numerical stability."}),
             },
             "optional": {
                 "pre_lora": ("PRE_LORA",),
@@ -39,7 +40,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load and Quantize INT8 models with fast triton inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, dynamic_lora=False, pre_lora=None):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, dynamic_lora=False, pre_lora=None, force_fp32_sensitive_layers=False):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         if pre_lora is not None:
@@ -55,6 +56,7 @@ class UNetLoaderINTW8A8:
         
         # Set quantization flags
         Int8TensorwiseOps.excluded_names = []
+        Int8TensorwiseOps.force_fp32_layers = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
         Int8TensorwiseOps.enable_convrot = enable_convrot
         Int8TensorwiseOps.use_triton = True
@@ -63,7 +65,9 @@ class UNetLoaderINTW8A8:
         if hasattr(Int8TensorwiseOps, "_logged_otf"):
             delattr(Int8TensorwiseOps, "_logged_otf")
         
-        # Check explicit model_type for exclusions
+        # Check explicit model_type for exclusions and fp32 layers
+        # Note: force_fp32_sensitive_layers works independently of on_the_fly_quantization
+        # It can force fp32 compute even when loading bf16/fp16 models without quantization
         if model_type == "flux2":
             Int8TensorwiseOps.excluded_names = [
                 'img_in', 'time_in', 'guidance_in', 'txt_in', 
@@ -85,29 +89,56 @@ class UNetLoaderINTW8A8:
             Int8TensorwiseOps.excluded_names = [
                 'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in'
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in'
+                ]
         elif model_type == "ernie":
             Int8TensorwiseOps.excluded_names = [
                 'time', 'x_embedder', 'text_proj', 'adaLN',
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'time', 'x_embedder', 'text_proj', 'adaLN',
+                ]
         elif model_type == "anima":
             Int8TensorwiseOps.excluded_names = [
                 'embed', 'llm', 'adaln',
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'embed', 'llm', 'adaln',
+                ]
         elif model_type == "hidream o1":
             Int8TensorwiseOps.excluded_names = [
                 'embed', 'language_model.layers.35.mlp',
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'embed', 'language_model.layers.35.mlp',
+                ]
         elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [
                 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head',
                 'img_emb',
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head',
+                    'img_emb',
+                ]
         elif model_type == "ltx2":
             Int8TensorwiseOps.excluded_names = [
                 'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
                 'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
                 'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
             ]
+            if force_fp32_sensitive_layers:
+                Int8TensorwiseOps.force_fp32_layers = [
+                    'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
+                    'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
+                    'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
+                ]
 
         # Load state dict once to detect model and prepare LoRA
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
